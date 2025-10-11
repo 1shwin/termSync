@@ -1,3 +1,4 @@
+#define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,6 +6,9 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <openssl/sha.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 #include "mongoose.h"
 #include "jansson.h"
 #include "common.h"
@@ -41,6 +45,7 @@ static int load_document_from_file(const char *filename, Document *doc);
 static void save_document_to_file(const char *filename, const Document *doc);
 static void ensure_directory_exists(const char *path);
 static void event_handler(struct mg_connection *c, int ev, void *ev_data, void *fn_data);
+void print_local_ip(void);
 
 
 void sha256_hex(const char *input, char out_hex[65]) {
@@ -210,6 +215,39 @@ static void event_handler(struct mg_connection *c, int ev, void *ev_data, void *
     (void) fn_data;
 }
 
+void print_local_ip() {
+    struct ifaddrs *ifaddr, *ifa;
+    int family, s;
+    char host[NI_MAXHOST];
+
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return;
+    }
+
+    printf("Server IP addresses:\n");
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL) continue;
+
+        family = ifa->ifa_addr->sa_family;
+
+        if (family == AF_INET) { // Only care about IPv4 for this simple case
+            s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                            host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+            if (s != 0) {
+                printf("getnameinfo() failed: %s\n", gai_strerror(s));
+                continue;
+            }
+            // Ignore loopback address
+            if (strcmp(host, "127.0.0.1") != 0) {
+                 printf("  -> %s\n", host);
+            }
+        }
+    }
+    freeifaddrs(ifaddr);
+}
+
+
 int main(void) {
     printf("Starting server...\n");
 
@@ -227,7 +265,9 @@ int main(void) {
     load_document_from_file(COOP_FILE, &g_doc);
 
     mg_mgr_init(&g_mgr);
-    printf("Server listening on ws://0.0.0.0:8000\n");
+    printf("Server listening on port 8000. Clients should connect to one of the IPs below:\n");
+    print_local_ip();
+
     mg_http_listen(&g_mgr, "ws://0.0.0.0:8000", event_handler, NULL);
 
     while (!g_done) {
