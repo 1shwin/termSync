@@ -1,0 +1,14 @@
+{
+  "docId": "document-cs",
+  "content": [
+    {
+      "type": "paragraph",
+      "children": [
+        {
+          "text": "Welcome to the Collaborative Editor!",
+          "styles": []
+        }
+      ]
+    }
+  ]
+}
