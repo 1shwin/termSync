@@ -442,3 +442,9 @@ For issues, questions, or feature requests:
 ---
 
 **Happy Collaborative Editing! 🎉**
+
+## AI Chats
+https://claude.ai/chat/dbd379da-2757-4e02-aa81-57000814b190
+https://chatgpt.com/c/68eb0203-3308-8323-9dcc-a6f0f96237b1
+https://gemini.google.com/app/64a03661d1d02663
+https://gemini.google.com/app/f0a5a7d2adb4e445
