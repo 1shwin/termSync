@@ -1,4 +1,4 @@
-# Collaborative Real-Time Text Editor
+# TermSync - A Terminal Text Editor for Real-Time Collaboration
 
 A feature-rich, real-time collaborative text editor written in C with terminal UI support. Multiple users can simultaneously edit the same document with live cursor tracking, text selection, rich formatting, and intelligent conflict resolution.
 
