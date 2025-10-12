@@ -70,14 +70,11 @@ sudo apt-get update
 sudo apt-get install build-essential libncurses5-dev libncursesw5-dev
 
 # Clone or download the repository
-git clone https://github.com/yourusername/collab-editor.git
-cd collab-editor
+git clone https://github.com/1shwin/mmga-megathon25.git
+cd mmga-megathon25
 
-# Compile server
-gcc -o server server.c -pthread -std=c11 -Wall -Wextra
-
-# Compile client
-gcc -o client client.c -pthread -lncurses -std=c11 -Wall -Wextra
+# Compile using the makefile
+make
 ```
 
 ### Fedora/RHEL/CentOS
@@ -85,9 +82,12 @@ gcc -o client client.c -pthread -lncurses -std=c11 -Wall -Wextra
 # Install dependencies
 sudo dnf install gcc ncurses-devel
 
-# Compile
-gcc -o server server.c -pthread -std=c11 -Wall -Wextra
-gcc -o client client.c -pthread -lncurses -std=c11 -Wall -Wextra
+# Clone or download the repository
+git clone https://github.com/1shwin/mmga-megathon25.git
+cd mmga-megathon25
+
+# Compile using the makefile
+make
 ```
 
 ### macOS
@@ -96,9 +96,13 @@ gcc -o client client.c -pthread -lncurses -std=c11 -Wall -Wextra
 xcode-select --install
 
 # ncurses is pre-installed on macOS
-# Compile
-gcc -o server server.c -pthread -std=c11 -Wall -Wextra
-gcc -o client client.c -pthread -lncurses -std=c11 -Wall -Wextra
+
+# Clone or download the repository
+git clone https://github.com/1shwin/mmga-megathon25.git
+cd mmga-megathon25
+
+# Compile using the makefile
+make
 ```
 
 ### Arch Linux
@@ -106,10 +110,12 @@ gcc -o client client.c -pthread -lncurses -std=c11 -Wall -Wextra
 # Install dependencies
 sudo pacman -S base-devel ncurses
 
-# Compile
-gcc -o server server.c -pthread -std=c11 -Wall -Wextra
-gcc -o client client.c -pthread -lncurses -std=c11 -Wall -Wextra
-```
+# Clone or download the repository
+git clone https://github.com/1shwin/mmga-megathon25.git
+cd mmga-megathon25
+
+# Compile using the makefile
+make```
 
 ## 🚀 Usage
 
