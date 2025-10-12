@@ -1,5 +1,5 @@
 // server.c
-#define _GNU_SOURCE  // for mkstemps
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +12,7 @@
 #include <stdbool.h>
 
 #include "common.h"
+#include "hash_util.h"
 
 // --- Server State ---
 typedef struct {
@@ -26,6 +27,20 @@ static Cursor   client_cursors[MAX_CLIENTS];
 static SelectionState client_selections[MAX_CLIENTS];
 
 static int next_user_id = 0;
+
+// --- Sync state ---
+static uint64_t document_version = 0;
+static uint8_t  document_hash[32] = {0};
+
+#define OP_LOG_SIZE 1000
+typedef struct {
+    NetMessage ops[OP_LOG_SIZE];
+    int head;
+    int count;
+    uint64_t oldest_version;
+} OperationLog;
+
+static OperationLog op_log = {0};
 
 static pthread_mutex_t doc_mutex     = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -55,12 +70,35 @@ static void init_document(void) {
     memset(&global_doc, 0, sizeof(Document));
     global_doc.num_lines = 1;
     global_doc.line_lengths[0] = 0;
+    document_version = 0;
+    compute_document_hash(global_doc.content, global_doc.line_lengths, 
+                         global_doc.num_lines, document_hash);
 
     memset(client_cursors, 0, sizeof(client_cursors));
     memset(client_selections, 0, sizeof(client_selections));
+    memset(&op_log, 0, sizeof(op_log));
+}
+
+static void update_document_version(void) {
+    document_version++;
+    compute_document_hash(global_doc.content, global_doc.line_lengths,
+                         global_doc.num_lines, document_hash);
+}
+
+static void log_operation(NetMessage *msg) {
+    msg->version = document_version;
+    op_log.ops[op_log.head] = *msg;
+    op_log.head = (op_log.head + 1) % OP_LOG_SIZE;
+    if (op_log.count < OP_LOG_SIZE) {
+        op_log.count++;
+        op_log.oldest_version = document_version - op_log.count + 1;
+    } else {
+        op_log.oldest_version++;
+    }
 }
 
 static void broadcast_message(NetMessage *msg) {
+    msg->version = document_version;
     pthread_mutex_lock(&clients_mutex);
     for (int i = 0; i < next_user_id; i++) {
         if (client_sockets[i] != 0) {
@@ -70,6 +108,8 @@ static void broadcast_message(NetMessage *msg) {
     pthread_mutex_unlock(&clients_mutex);
 }
 
+static void send_full_document_state(int sock);
+static void handle_reconnect_sync(int sock, NetMessage *msg);
 static void *handle_client(void *client_socket_ptr);
 static void apply_operation(NetMessage *msg);
 static void run_code_block(NetMessage *msg);
@@ -83,7 +123,6 @@ int main(void) {
 
     init_document();
 
-    // Create server socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
         perror("socket failed"); exit(EXIT_FAILURE);
     }
@@ -101,12 +140,10 @@ int main(void) {
         perror("listen"); exit(EXIT_FAILURE);
     }
 
-    // Info banner
     printf("\n--- C Collaborative Editor Server ---\n");
     printf("WARNING: Code execution is ENABLED. Run only on a trusted LAN.\n");
     printf("Listening on port %d\n", PORT);
 
-    // Best-effort to print IP
     char hostbuffer[256];
     if (gethostname(hostbuffer, sizeof(hostbuffer)) == 0) {
         struct hostent *host_entry = gethostbyname(hostbuffer);
@@ -150,7 +187,6 @@ static void *handle_client(void *client_socket_ptr) {
 
     int user_id = -1;
 
-    // Find user_id for this socket
     pthread_mutex_lock(&clients_mutex);
     for (int i = 0; i < next_user_id; i++) {
         if (client_sockets[i] == sock) { user_id = i; break; }
@@ -161,32 +197,13 @@ static void *handle_client(void *client_socket_ptr) {
     NetMessage id_msg = {0};
     id_msg.type = S2C_USER_ID_ASSIGN;
     id_msg.user_id = user_id;
+    id_msg.version = document_version;
     send_all(sock, &id_msg, sizeof(NetMessage));
 
-    // 2) Send initial document state (as a sequence of inserts/newlines)
-    pthread_mutex_lock(&doc_mutex);
-    for (int y = 0; y < global_doc.num_lines; y++) {
-        for (int x = 0; x < global_doc.line_lengths[y]; x++) {
-            NetMessage state_msg = {0};
-            state_msg.type = S2C_INSERT;
-            state_msg.user_id = -1; // system
-            state_msg.payload.insert_op.y = y;
-            state_msg.payload.insert_op.x = x;
-            state_msg.payload.insert_op.s_char = global_doc.content[y][x];
-            send_all(sock, &state_msg, sizeof(NetMessage));
-        }
-        if (y < global_doc.num_lines - 1) {
-            NetMessage newline_msg = {0};
-            newline_msg.type = S2C_NEWLINE;
-            newline_msg.user_id = -1;
-            newline_msg.payload.newline_op.y = y;
-            newline_msg.payload.newline_op.x = global_doc.line_lengths[y];
-            send_all(sock, &newline_msg, sizeof(NetMessage));
-        }
-    }
-    pthread_mutex_unlock(&doc_mutex);
+    // 2) Send initial document state
+    send_full_document_state(sock);
 
-    // 3) Send currently active cursors and selections (nice-to-have)
+    // 3) Send currently active cursors and selections
     pthread_mutex_lock(&clients_mutex);
     for (int i = 0; i < next_user_id; ++i) {
         if (i == user_id) continue;
@@ -194,10 +211,12 @@ static void *handle_client(void *client_socket_ptr) {
             if (client_cursors[i].active) {
                 NetMessage c = {0}; c.type = S2C_CURSOR_UPDATE; c.user_id = i;
                 c.payload.cursor_op = client_cursors[i];
+                c.version = document_version;
                 send_all(sock, &c, sizeof(NetMessage));
             }
             NetMessage s = {0}; s.type = S2C_SELECTION_UPDATE; s.user_id = i;
             s.payload.selection_op = client_selections[i];
+            s.version = document_version;
             send_all(sock, &s, sizeof(NetMessage));
         }
     }
@@ -206,8 +225,13 @@ static void *handle_client(void *client_socket_ptr) {
     // 4) Read loop
     NetMessage client_msg;
     while (recv_all(sock, &client_msg, sizeof(NetMessage)) > 0) {
-        client_msg.user_id = user_id; // tag correctly
-        apply_operation(&client_msg);
+        client_msg.user_id = user_id;
+        
+        if (client_msg.type == C2S_RECONNECT_SYNC) {
+            handle_reconnect_sync(sock, &client_msg);
+        } else {
+            apply_operation(&client_msg);
+        }
     }
 
     // Disconnected
@@ -233,7 +257,123 @@ static void *handle_client(void *client_socket_ptr) {
     return NULL;
 }
 
-// --- Range helpers (server) ---
+static void send_full_document_state(int sock) {
+    pthread_mutex_lock(&doc_mutex);
+    for (int y = 0; y < global_doc.num_lines; y++) {
+        for (int x = 0; x < global_doc.line_lengths[y]; x++) {
+            NetMessage state_msg = {0};
+            state_msg.type = S2C_INSERT;
+            state_msg.user_id = -1;
+            state_msg.version = document_version;
+            state_msg.payload.insert_op.y = y;
+            state_msg.payload.insert_op.x = x;
+            state_msg.payload.insert_op.s_char = global_doc.content[y][x];
+            send_all(sock, &state_msg, sizeof(NetMessage));
+        }
+        if (y < global_doc.num_lines - 1) {
+            NetMessage newline_msg = {0};
+            newline_msg.type = S2C_NEWLINE;
+            newline_msg.user_id = -1;
+            newline_msg.version = document_version;
+            newline_msg.payload.newline_op.y = y;
+            newline_msg.payload.newline_op.x = global_doc.line_lengths[y];
+            send_all(sock, &newline_msg, sizeof(NetMessage));
+        }
+    }
+    
+    // Send sync complete marker
+    NetMessage complete = {0};
+    complete.type = S2C_SYNC_COMPLETE;
+    complete.version = document_version;
+    send_all(sock, &complete, sizeof(NetMessage));
+    pthread_mutex_unlock(&doc_mutex);
+}
+
+static void handle_reconnect_sync(int sock, NetMessage *msg) {
+    pthread_mutex_lock(&doc_mutex);
+    
+    ReconnectSyncRequest *req = &msg->payload.reconnect_req;
+    SyncResponse response = {0};
+    response.server_version = document_version;
+    memcpy(response.server_hash, document_hash, 32);
+    
+    printf("Client %d reconnect: client v%lu, server v%lu\n",
+           msg->user_id, req->client_version, document_version);
+    
+    // Case 1: Already in sync
+    if (req->client_version == document_version &&
+        hashes_equal(req->client_hash, document_hash)) {
+        response.needs_full_sync = false;
+        response.ops_count = 0;
+        
+        NetMessage sync_msg = {0};
+        sync_msg.type = S2C_SYNC_RESPONSE;
+        sync_msg.version = document_version;
+        sync_msg.payload.sync_response = response;
+        send_all(sock, &sync_msg, sizeof(NetMessage));
+        
+        printf("  -> Already in sync\n");
+        pthread_mutex_unlock(&doc_mutex);
+        return;
+    }
+    
+    // Case 2: Incremental sync possible
+    if (req->client_version >= op_log.oldest_version &&
+        req->client_version < document_version) {
+        
+        response.needs_full_sync = false;
+        response.ops_count = 0;
+        
+        // Count ops after client version
+        for (int i = 0; i < op_log.count; i++) {
+            int idx = (op_log.head - op_log.count + i + OP_LOG_SIZE) % OP_LOG_SIZE;
+            if (op_log.ops[idx].version > req->client_version) {
+                response.ops_count++;
+            }
+        }
+        
+        NetMessage sync_msg = {0};
+        sync_msg.type = S2C_SYNC_RESPONSE;
+        sync_msg.version = document_version;
+        sync_msg.payload.sync_response = response;
+        send_all(sock, &sync_msg, sizeof(NetMessage));
+        
+        // Send incremental ops
+        for (int i = 0; i < op_log.count; i++) {
+            int idx = (op_log.head - op_log.count + i + OP_LOG_SIZE) % OP_LOG_SIZE;
+            if (op_log.ops[idx].version > req->client_version) {
+                send_all(sock, &op_log.ops[idx], sizeof(NetMessage));
+            }
+        }
+        
+        NetMessage complete = {0};
+        complete.type = S2C_SYNC_COMPLETE;
+        complete.version = document_version;
+        send_all(sock, &complete, sizeof(NetMessage));
+        
+        printf("  -> Incremental sync: %d ops\n", response.ops_count);
+        pthread_mutex_unlock(&doc_mutex);
+        return;
+    }
+    
+    // Case 3: Full resync needed
+    response.needs_full_sync = true;
+    response.ops_count = 0;
+    
+    NetMessage sync_msg = {0};
+    sync_msg.type = S2C_SYNC_RESPONSE;
+    sync_msg.version = document_version;
+    sync_msg.payload.sync_response = response;
+    send_all(sock, &sync_msg, sizeof(NetMessage));
+    
+    printf("  -> Full resync required\n");
+    pthread_mutex_unlock(&doc_mutex);
+    
+    // Send full state
+    send_full_document_state(sock);
+}
+
+// --- Range helpers ---
 static void normalize_range(Range *r) {
     if (r->y1 > r->y2 || (r->y1 == r->y2 && r->x1 > r->x2)) {
         int ty = r->y1, tx = r->x1; r->y1 = r->y2; r->x1 = r->x2; r->y2 = ty; r->x2 = tx;
@@ -259,7 +399,7 @@ static void apply_format_range(FormatRangeOp *op) {
 static bool apply_delete_range(DeleteRangeOp *op, int *merge_y, int *merge_x) {
     Range r = op->range; normalize_range(&r);
     if (!clamp_range_to_doc(&r)) return false;
-    if (r.y1 == r.y2 && r.x1 == r.x2) return false; // empty
+    if (r.y1 == r.y2 && r.x1 == r.x2) return false;
 
     if (r.y1 == r.y2) {
         int y = r.y1, x1 = r.x1, x2 = r.x2;
@@ -273,13 +413,11 @@ static bool apply_delete_range(DeleteRangeOp *op, int *merge_y, int *merge_x) {
         int keep_len   = x1;
         int suffix_len = global_doc.line_lengths[y2] - x2;
 
-        if (keep_len + suffix_len > MAX_LINE_LEN) return false; // simple overflow guard
+        if (keep_len + suffix_len > MAX_LINE_LEN) return false;
 
-        // merge into y1
         memcpy(&global_doc.content[y1][x1], &global_doc.content[y2][x2], suffix_len * sizeof(StyledChar));
         global_doc.line_lengths[y1] = keep_len + suffix_len;
 
-        // remove lines y1+1..y2
         int lines_to_remove = y2 - y1;
         memmove(&global_doc.content[y1 + 1], &global_doc.content[y2 + 1],
                 (global_doc.num_lines - y2 - 1) * sizeof(global_doc.content[0]));
@@ -296,7 +434,7 @@ static bool apply_delete_range(DeleteRangeOp *op, int *merge_y, int *merge_x) {
 static void apply_operation(NetMessage *msg) {
     pthread_mutex_lock(&doc_mutex);
 
-    NetMessage bmsg = *msg; // copy for broadcast
+    NetMessage bmsg = *msg;
     int y, x;
 
     switch ((C2S_OpType)msg->type) {
@@ -308,7 +446,10 @@ static void apply_operation(NetMessage *msg) {
                         (global_doc.line_lengths[y] - x) * sizeof(StyledChar));
                 global_doc.content[y][x] = msg->payload.insert_op.s_char;
                 global_doc.line_lengths[y]++;
-                bmsg.type = S2C_INSERT; broadcast_message(&bmsg);
+                update_document_version();
+                bmsg.type = S2C_INSERT;
+                log_operation(&bmsg);
+                broadcast_message(&bmsg);
             }
             break;
 
@@ -318,7 +459,10 @@ static void apply_operation(NetMessage *msg) {
                 memmove(&global_doc.content[y][x-1], &global_doc.content[y][x],
                         (global_doc.line_lengths[y] - x + 1) * sizeof(StyledChar));
                 global_doc.line_lengths[y]--;
-                bmsg.type = S2C_DELETE; broadcast_message(&bmsg);
+                update_document_version();
+                bmsg.type = S2C_DELETE;
+                log_operation(&bmsg);
+                broadcast_message(&bmsg);
             }
             break;
 
@@ -328,7 +472,10 @@ static void apply_operation(NetMessage *msg) {
                 memmove(&global_doc.content[y][x], &global_doc.content[y][x+1],
                         (global_doc.line_lengths[y] - x) * sizeof(StyledChar));
                 global_doc.line_lengths[y]--;
-                bmsg.type = S2C_DELETE_FORWARD; broadcast_message(&bmsg);
+                update_document_version();
+                bmsg.type = S2C_DELETE_FORWARD;
+                log_operation(&bmsg);
+                broadcast_message(&bmsg);
             }
             break;
 
@@ -347,9 +494,11 @@ static void apply_operation(NetMessage *msg) {
                     memmove(&global_doc.line_lengths[y], &global_doc.line_lengths[y+1],
                             (global_doc.num_lines - y - 1) * sizeof(int));
                     global_doc.num_lines--;
+                    update_document_version();
                     bmsg.type = S2C_MERGE_LINE;
                     bmsg.payload.delete_op.y = y;
                     bmsg.payload.delete_op.x = dest_x;
+                    log_operation(&bmsg);
                     broadcast_message(&bmsg);
                 }
             }
@@ -372,7 +521,10 @@ static void apply_operation(NetMessage *msg) {
                 memcpy(&global_doc.content[y + 1][0], buffer, len_to_move * sizeof(StyledChar));
                 global_doc.num_lines++;
 
-                bmsg.type = S2C_NEWLINE; broadcast_message(&bmsg);
+                update_document_version();
+                bmsg.type = S2C_NEWLINE;
+                log_operation(&bmsg);
+                broadcast_message(&bmsg);
             }
             break;
 
@@ -380,32 +532,40 @@ static void apply_operation(NetMessage *msg) {
             y = msg->payload.format_op.y; x = msg->payload.format_op.x;
             if (y < global_doc.num_lines && x < global_doc.line_lengths[y]) {
                 global_doc.content[y][x].format = msg->payload.format_op.format;
-                bmsg.type = S2C_FORMAT_UPDATE; broadcast_message(&bmsg);
+                update_document_version();
+                bmsg.type = S2C_FORMAT_UPDATE;
+                log_operation(&bmsg);
+                broadcast_message(&bmsg);
             }
             break;
 
         case C2S_CURSOR_MOVE:
             client_cursors[msg->user_id] = msg->payload.cursor_op;
-            bmsg.type = S2C_CURSOR_UPDATE; broadcast_message(&bmsg);
+            bmsg.type = S2C_CURSOR_UPDATE;
+            broadcast_message(&bmsg);
             break;
 
         case C2S_RUN_CODE:
-            pthread_mutex_unlock(&doc_mutex); // run without doc lock
+            pthread_mutex_unlock(&doc_mutex);
             run_code_block(msg);
             return;
 
         case C2S_FORMAT_RANGE:
             apply_format_range(&msg->payload.format_range_op);
-            bmsg.type = S2C_FORMAT_RANGE; broadcast_message(&bmsg);
+            update_document_version();
+            bmsg.type = S2C_FORMAT_RANGE;
+            log_operation(&bmsg);
+            broadcast_message(&bmsg);
             break;
 
         case C2S_DELETE_RANGE: {
             int my = 0, mx = 0;
             if (apply_delete_range(&msg->payload.delete_range_op, &my, &mx)) {
+                update_document_version();
                 bmsg.type = S2C_DELETE_RANGE;
-                // include merge target in DeleteOp for cursor placement if desired
                 bmsg.payload.delete_op.y = my;
                 bmsg.payload.delete_op.x = mx;
+                log_operation(&bmsg);
                 broadcast_message(&bmsg);
             }
             break;
@@ -413,14 +573,19 @@ static void apply_operation(NetMessage *msg) {
 
         case C2S_SELECTION_UPDATE:
             client_selections[msg->user_id] = msg->payload.selection_op;
-            bmsg.type = S2C_SELECTION_UPDATE; broadcast_message(&bmsg);
+            bmsg.type = S2C_SELECTION_UPDATE;
+            broadcast_message(&bmsg);
+            break;
+
+        case C2S_RECONNECT_SYNC:
+            // Handled separately
             break;
     }
 
     pthread_mutex_unlock(&doc_mutex);
 }
 
-// --- Run code blocks (``` ... ```) ---
+// --- Run code blocks ---
 static void run_code_block(NetMessage *msg) {
     char filename[] = "/tmp/collab_code_XXXXXX.c";
     char exename[]  = "/tmp/collab_code_XXXXXX";
@@ -436,7 +601,6 @@ static void run_code_block(NetMessage *msg) {
     }
     close(c_fd); close(exe_fd);
 
-    // Find the first ``` code block in the document
     pthread_mutex_lock(&doc_mutex);
     int start_y = -1, start_x = -1, end_y = -1, end_x = -1;
     bool in_block = false;

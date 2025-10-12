@@ -42,6 +42,19 @@ typedef struct {
     bool  active;
 } SelectionState;
 
+// --- Sync structures ---
+typedef struct {
+    uint64_t client_version;
+    uint8_t  client_hash[32];
+} ReconnectSyncRequest;
+
+typedef struct {
+    uint64_t server_version;
+    uint8_t  server_hash[32];
+    bool     needs_full_sync;
+    int      ops_count;
+} SyncResponse;
+
 // --- Operation Payloads ---
 typedef struct {
     int y;
@@ -88,6 +101,7 @@ typedef enum {
     C2S_FORMAT_RANGE,     // selection format
     C2S_DELETE_RANGE,     // selection delete
     C2S_SELECTION_UPDATE, // selection broadcast
+    C2S_RECONNECT_SYNC,   // reconnection sync request
 } C2S_OpType;
 
 // Server-to-Client (S2C) Message Types
@@ -105,6 +119,8 @@ typedef enum {
     S2C_FORMAT_RANGE,
     S2C_DELETE_RANGE,
     S2C_SELECTION_UPDATE, // selection broadcast
+    S2C_SYNC_RESPONSE,    // sync response
+    S2C_SYNC_COMPLETE,    // sync complete marker
 } S2C_MsgType;
 
 // --- Network Message ---
@@ -112,6 +128,7 @@ typedef enum {
 typedef struct {
     int user_id;
     int type; // cast to C2S_OpType on server, S2C_MsgType on client
+    uint64_t version; // document version number
     union {
         // C2S payloads
         InsertOp       insert_op;
@@ -122,9 +139,11 @@ typedef struct {
         FormatRangeOp  format_range_op;
         DeleteRangeOp  delete_range_op;
         SelectionState selection_op;
+        ReconnectSyncRequest reconnect_req;
 
         // S2C payloads
         char           code_output[1024];
+        SyncResponse   sync_response;
     } payload;
 } NetMessage;
 

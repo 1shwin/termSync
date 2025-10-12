@@ -7,8 +7,10 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <ncurses.h>
+#include <errno.h>
 
 #include "common.h"
+#include "hash_util.h"
 
 // --- Client State ---
 typedef struct {
@@ -21,13 +23,22 @@ static Document local_doc;
 
 static Cursor user_cursor;
 static Cursor other_cursors[MAX_CLIENTS];
-
-static SelectionState other_selections[MAX_CLIENTS]; // remote selections
+static SelectionState other_selections[MAX_CLIENTS];
 
 static int     my_user_id   = -1;
 static int     server_sock  = -1;
 static char    status_message[100] = "";
 static uint8_t current_format      = ATTR_NONE;
+
+// --- Sync state ---
+static uint64_t local_version = 0;
+static uint8_t  local_hash[32] = {0};
+static bool     connected = false;
+static bool     syncing = false;
+
+#define OFFLINE_QUEUE_SIZE 100
+static NetMessage offline_queue[OFFLINE_QUEUE_SIZE];
+static int offline_count = 0;
 
 static pthread_mutex_t doc_mutex     = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t ncurses_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -35,8 +46,8 @@ static pthread_mutex_t ncurses_mutex = PTHREAD_MUTEX_INITIALIZER;
 // --- Selection (local-only state) ---
 typedef struct {
     bool active;
-    int  ay, ax; // anchor
-    int  hy, hx; // head
+    int  ay, ax;
+    int  hy, hx;
 } Selection;
 
 static Selection selection = (Selection){0};
@@ -49,6 +60,9 @@ static void *receive_handler(void *socket_desc);
 static void send_op(NetMessage *msg);
 static void apply_server_message(NetMessage *msg);
 static void toggle_format(uint8_t format_to_toggle);
+static bool attempt_reconnect(const char *server_ip);
+static void queue_offline_op(NetMessage *msg);
+static void update_local_version(void);
 
 // Selection helpers
 static void selection_clear(void);
@@ -102,6 +116,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    connected = true;
     memset(&local_doc, 0, sizeof(Document));
     local_doc.num_lines = 1;
     memset(other_cursors,    0, sizeof(other_cursors));
@@ -122,7 +137,16 @@ int main(int argc, char *argv[]) {
     int ch;
     while ((ch = getch()) != KEY_F(1)) {
         NetMessage msg = (NetMessage){0};
-        bool queued_send = false; // send msg after switch
+        bool queued_send = false;
+
+        // Check connection status periodically
+        if (!connected && !syncing) {
+            if (attempt_reconnect(argv[1])) {
+                snprintf(status_message, sizeof(status_message), 
+                        "Reconnected! Syncing...");
+                redraw();
+            }
+        }
 
         pthread_mutex_lock(&doc_mutex);
 
@@ -347,6 +371,15 @@ static void *receive_handler(void *socket_desc) {
         pthread_mutex_unlock(&doc_mutex);
         redraw();
     }
+    
+    // Connection lost
+    pthread_mutex_lock(&doc_mutex);
+    connected = false;
+    snprintf(status_message, sizeof(status_message), 
+            "Disconnected! Press any key to reconnect...");
+    pthread_mutex_unlock(&doc_mutex);
+    redraw();
+    
     return NULL;
 }
 
@@ -360,6 +393,50 @@ static void apply_server_message(NetMessage *msg) {
         case S2C_USER_ID_ASSIGN:
             my_user_id = msg->user_id;
             user_cursor.user_id = my_user_id;
+            local_version = msg->version;
+            break;
+
+        case S2C_SYNC_RESPONSE: {
+            SyncResponse *resp = &msg->payload.sync_response;
+            
+            if (resp->needs_full_sync) {
+                // Clear local document for full resync
+                memset(&local_doc, 0, sizeof(Document));
+                local_doc.num_lines = 1;
+                offline_count = 0; // Discard offline ops
+                snprintf(status_message, sizeof(status_message),
+                        "Full resync in progress...");
+            } else if (resp->ops_count > 0) {
+                snprintf(status_message, sizeof(status_message),
+                        "Receiving %d updates...", resp->ops_count);
+            } else {
+                snprintf(status_message, sizeof(status_message),
+                        "Already in sync!");
+                connected = true;
+                syncing = false;
+            }
+            break;
+        }
+
+        case S2C_SYNC_COMPLETE:
+            // Sync complete - replay offline ops
+            local_version = msg->version;
+            compute_document_hash(local_doc.content, local_doc.line_lengths,
+                                 local_doc.num_lines, local_hash);
+            
+            if (offline_count > 0) {
+                snprintf(status_message, sizeof(status_message),
+                        "Replaying %d offline edits...", offline_count);
+                for (int i = 0; i < offline_count; i++) {
+                    send_all(server_sock, &offline_queue[i], sizeof(NetMessage));
+                }
+                offline_count = 0;
+            }
+            
+            connected = true;
+            syncing = false;
+            snprintf(status_message, sizeof(status_message),
+                    "Sync complete!");
             break;
 
         case S2C_INSERT:
@@ -375,6 +452,8 @@ static void apply_server_message(NetMessage *msg) {
 
             if (msg->user_id == my_user_id) user_cursor.x++;
             else if (y == user_cursor.y && x < user_cursor.x) user_cursor.x++;
+            
+            update_local_version();
             break;
 
         case S2C_DELETE:
@@ -388,6 +467,8 @@ static void apply_server_message(NetMessage *msg) {
 
             if (msg->user_id == my_user_id) user_cursor.x--;
             else if (y == user_cursor.y && x <= user_cursor.x) user_cursor.x--;
+            
+            update_local_version();
             break;
 
         case S2C_DELETE_FORWARD:
@@ -400,11 +481,13 @@ static void apply_server_message(NetMessage *msg) {
             local_doc.line_lengths[y]--;
 
             if (msg->user_id != my_user_id && y == user_cursor.y && x < user_cursor.x) user_cursor.x--;
+            
+            update_local_version();
             break;
 
         case S2C_MERGE_LINE: {
-            y = msg->payload.delete_op.y; // removed line index
-            x = msg->payload.delete_op.x; // merge point in dest line
+            y = msg->payload.delete_op.y;
+            x = msg->payload.delete_op.x;
             if (y <= 0 || y >= local_doc.num_lines) return;
 
             int dest_y = y - 1;
@@ -425,6 +508,8 @@ static void apply_server_message(NetMessage *msg) {
                 if (user_cursor.y == y)      { user_cursor.y = dest_y; user_cursor.x += x; }
                 else if (user_cursor.y > y)  { user_cursor.y--; }
             }
+            
+            update_local_version();
             break;
         }
 
@@ -449,6 +534,8 @@ static void apply_server_message(NetMessage *msg) {
 
             if (msg->user_id == my_user_id) { user_cursor.y++; user_cursor.x = 0; }
             else if (y < user_cursor.y)     { user_cursor.y++; }
+            
+            update_local_version();
             break;
         }
 
@@ -458,6 +545,7 @@ static void apply_server_message(NetMessage *msg) {
             if (y < local_doc.num_lines && x < local_doc.line_lengths[y]) {
                 local_doc.content[y][x].format = msg->payload.format_op.format;
             }
+            update_local_version();
             break;
 
         case S2C_CURSOR_UPDATE:
@@ -482,6 +570,7 @@ static void apply_server_message(NetMessage *msg) {
                     local_doc.content[yy][xx].format ^= bits;
                 }
             }
+            update_local_version();
             break;
         }
 
@@ -535,6 +624,7 @@ static void apply_server_message(NetMessage *msg) {
                     else if (user_cursor.y > y2) { user_cursor.y -= (y2 - y1); }
                 }
             }
+            update_local_version();
             break;
         }
 
@@ -550,6 +640,88 @@ static void apply_server_message(NetMessage *msg) {
             snprintf(status_message, sizeof(status_message), "%.95s", msg->payload.code_output);
             break;
     }
+}
+
+static void update_local_version(void) {
+    local_version++;
+    compute_document_hash(local_doc.content, local_doc.line_lengths,
+                         local_doc.num_lines, local_hash);
+}
+
+static void queue_offline_op(NetMessage *msg) {
+    if (offline_count < OFFLINE_QUEUE_SIZE) {
+        offline_queue[offline_count++] = *msg;
+    }
+}
+
+static bool attempt_reconnect(const char *server_ip) {
+    if (syncing) return false; // Already attempting
+    
+    syncing = true;
+    
+    // Close old socket
+    close(server_sock);
+    
+    // Create new socket
+    struct sockaddr_in serv_addr;
+    if ((server_sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        syncing = false;
+        return false;
+    }
+    
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port   = htons(PORT);
+    if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
+        close(server_sock);
+        syncing = false;
+        return false;
+    }
+    
+    if (connect(server_sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(server_sock);
+        syncing = false;
+        return false;
+    }
+    
+    // Restart receive thread
+    pthread_t recv_thread;
+    if (pthread_create(&recv_thread, NULL, receive_handler, &server_sock) < 0) {
+        close(server_sock);
+        syncing = false;
+        return false;
+    }
+    pthread_detach(recv_thread);
+    
+    // Wait for user ID assignment
+    NetMessage id_msg;
+    if (recv_all(server_sock, &id_msg, sizeof(NetMessage)) <= 0 ||
+        id_msg.type != S2C_USER_ID_ASSIGN) {
+        syncing = false;
+        return false;
+    }
+    my_user_id = id_msg.user_id;
+    user_cursor.user_id = my_user_id;
+    
+    // Send sync request
+    pthread_mutex_lock(&doc_mutex);
+    compute_document_hash(local_doc.content, local_doc.line_lengths,
+                         local_doc.num_lines, local_hash);
+    
+    NetMessage sync_req = {0};
+    sync_req.type = C2S_RECONNECT_SYNC;
+    sync_req.user_id = my_user_id;
+    sync_req.payload.reconnect_req.client_version = local_version;
+    memcpy(sync_req.payload.reconnect_req.client_hash, local_hash, 32);
+    
+    if (send_all(server_sock, &sync_req, sizeof(NetMessage)) <= 0) {
+        pthread_mutex_unlock(&doc_mutex);
+        syncing = false;
+        return false;
+    }
+    pthread_mutex_unlock(&doc_mutex);
+    
+    // Response will be handled by receive_handler
+    return true;
 }
 
 static void redraw(void) {
@@ -581,7 +753,7 @@ static void redraw(void) {
             }
             if (inSelfSel) attrs |= A_REVERSE;
 
-            // Remote selection tint (use user color), only if not in our selection
+            // Remote selection tint
             int remote_pair = 0;
             if (!inSelfSel) {
                 for (int i = 0; i < MAX_CLIENTS; ++i) {
@@ -609,7 +781,7 @@ static void redraw(void) {
         }
     }
 
-    // Render other cursors (clamped to screen)
+    // Render other cursors
     int max_y, max_x; getmaxyx(stdscr, max_y, max_x);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (other_cursors[i].active && i != my_user_id) {
@@ -645,8 +817,15 @@ static void redraw(void) {
             if (ex2 > sx2) sel_count += (ex2 - sx2);
         }
     }
-    mvprintw(max_y - 2, max_x - 45, "Ln %d, Col %d  Format: %s  Sel: %d",
-             user_cursor.y + 1, user_cursor.x + 1, format_str, sel ? sel_count : 0);
+    
+    // Connection status
+    const char *conn_status = connected ? "Connected" : 
+                             syncing ? "Syncing..." : 
+                             "OFFLINE";
+    
+    mvprintw(max_y - 2, max_x - 60, "Ln %d, Col %d  Format: %s  Sel: %d  [%s] v%lu",
+             user_cursor.y + 1, user_cursor.x + 1, format_str, 
+             sel ? sel_count : 0, conn_status, local_version);
 
     mvprintw(max_y - 1, 0, "%s", status_message);
     clrtoeol();
@@ -665,6 +844,7 @@ static void init_tui(void) {
     keypad(stdscr, TRUE);
     noecho();
     start_color();
+    timeout(100); // 100ms timeout for getch() to check reconnection
 
     init_pair(1, COLOR_WHITE,  COLOR_RED);
     init_pair(2, COLOR_WHITE,  COLOR_GREEN);
@@ -679,7 +859,21 @@ static void cleanup_tui(void) { endwin(); }
 
 static void send_op(NetMessage *msg) {
     msg->user_id = my_user_id;
-    (void)send_all(server_sock, msg, sizeof(NetMessage));
+    
+    if (connected) {
+        if (send_all(server_sock, msg, sizeof(NetMessage)) <= 0) {
+            // Send failed - connection lost
+            connected = false;
+            queue_offline_op(msg);
+            snprintf(status_message, sizeof(status_message),
+                    "Disconnected! Queued %d ops", offline_count);
+        }
+    } else {
+        // Queue for later
+        queue_offline_op(msg);
+        snprintf(status_message, sizeof(status_message),
+                "Offline - queued %d ops", offline_count);
+    }
 }
 
 static void toggle_format(uint8_t format_to_toggle) {
