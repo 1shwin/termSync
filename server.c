@@ -1,4 +1,3 @@
-// server.c
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +13,6 @@
 #include "common.h"
 #include "hash_util.h"
 
-// --- Server State ---
 typedef struct {
     StyledChar content[MAX_LINES][MAX_LINE_LEN];
     int        line_lengths[MAX_LINES];
@@ -28,7 +26,6 @@ static SelectionState client_selections[MAX_CLIENTS];
 
 static int next_user_id = 0;
 
-// --- Sync state ---
 static uint64_t document_version = 0;
 static uint8_t  document_hash[32] = {0};
 
@@ -45,7 +42,6 @@ static OperationLog op_log = {0};
 static pthread_mutex_t doc_mutex     = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// --- Robust send/recv ---
 static ssize_t send_all(int fd, const void *buf, size_t len) {
     const char *p = (const char *)buf; size_t off = 0;
     while (off < len) {
@@ -65,7 +61,6 @@ static ssize_t recv_all(int fd, void *buf, size_t len) {
     return (ssize_t)off;
 }
 
-// --- Helpers ---
 static void init_document(void) {
     memset(&global_doc, 0, sizeof(Document));
     global_doc.num_lines = 1;
@@ -114,7 +109,6 @@ static void *handle_client(void *client_socket_ptr);
 static void apply_operation(NetMessage *msg);
 static void run_code_block(NetMessage *msg);
 
-// --- Main ---
 int main(void) {
     int server_fd, new_socket;
     struct sockaddr_in address;
@@ -180,7 +174,6 @@ int main(void) {
     return 0;
 }
 
-// --- Client thread ---
 static void *handle_client(void *client_socket_ptr) {
     int sock = *(int *)client_socket_ptr;
     free(client_socket_ptr);
@@ -193,17 +186,14 @@ static void *handle_client(void *client_socket_ptr) {
     }
     pthread_mutex_unlock(&clients_mutex);
 
-    // 1) Assign User ID
     NetMessage id_msg = {0};
     id_msg.type = S2C_USER_ID_ASSIGN;
     id_msg.user_id = user_id;
     id_msg.version = document_version;
     send_all(sock, &id_msg, sizeof(NetMessage));
 
-    // 2) Send initial document state
     send_full_document_state(sock);
 
-    // 3) Send currently active cursors and selections
     pthread_mutex_lock(&clients_mutex);
     for (int i = 0; i < next_user_id; ++i) {
         if (i == user_id) continue;
@@ -222,7 +212,6 @@ static void *handle_client(void *client_socket_ptr) {
     }
     pthread_mutex_unlock(&clients_mutex);
 
-    // 4) Read loop
     NetMessage client_msg;
     while (recv_all(sock, &client_msg, sizeof(NetMessage)) > 0) {
         client_msg.user_id = user_id;
@@ -234,7 +223,6 @@ static void *handle_client(void *client_socket_ptr) {
         }
     }
 
-    // Disconnected
     printf("Client %d disconnected.\n", user_id);
     pthread_mutex_lock(&clients_mutex);
     client_sockets[user_id] = 0;
@@ -281,7 +269,6 @@ static void send_full_document_state(int sock) {
         }
     }
     
-    // Send sync complete marker
     NetMessage complete = {0};
     complete.type = S2C_SYNC_COMPLETE;
     complete.version = document_version;
@@ -300,7 +287,6 @@ static void handle_reconnect_sync(int sock, NetMessage *msg) {
     printf("Client %d reconnect: client v%lu, server v%lu\n",
            msg->user_id, req->client_version, document_version);
     
-    // Case 1: Already in sync
     if (req->client_version == document_version &&
         hashes_equal(req->client_hash, document_hash)) {
         response.needs_full_sync = false;
@@ -317,14 +303,12 @@ static void handle_reconnect_sync(int sock, NetMessage *msg) {
         return;
     }
     
-    // Case 2: Incremental sync possible
     if (req->client_version >= op_log.oldest_version &&
         req->client_version < document_version) {
         
         response.needs_full_sync = false;
         response.ops_count = 0;
         
-        // Count ops after client version
         for (int i = 0; i < op_log.count; i++) {
             int idx = (op_log.head - op_log.count + i + OP_LOG_SIZE) % OP_LOG_SIZE;
             if (op_log.ops[idx].version > req->client_version) {
@@ -338,7 +322,6 @@ static void handle_reconnect_sync(int sock, NetMessage *msg) {
         sync_msg.payload.sync_response = response;
         send_all(sock, &sync_msg, sizeof(NetMessage));
         
-        // Send incremental ops
         for (int i = 0; i < op_log.count; i++) {
             int idx = (op_log.head - op_log.count + i + OP_LOG_SIZE) % OP_LOG_SIZE;
             if (op_log.ops[idx].version > req->client_version) {
@@ -356,7 +339,6 @@ static void handle_reconnect_sync(int sock, NetMessage *msg) {
         return;
     }
     
-    // Case 3: Full resync needed
     response.needs_full_sync = true;
     response.ops_count = 0;
     
@@ -369,11 +351,9 @@ static void handle_reconnect_sync(int sock, NetMessage *msg) {
     printf("  -> Full resync required\n");
     pthread_mutex_unlock(&doc_mutex);
     
-    // Send full state
     send_full_document_state(sock);
 }
 
-// --- Range helpers ---
 static void normalize_range(Range *r) {
     if (r->y1 > r->y2 || (r->y1 == r->y2 && r->x1 > r->x2)) {
         int ty = r->y1, tx = r->x1; r->y1 = r->y2; r->x1 = r->x2; r->y2 = ty; r->x2 = tx;
@@ -430,7 +410,6 @@ static bool apply_delete_range(DeleteRangeOp *op, int *merge_y, int *merge_x) {
     }
 }
 
-// --- Apply operation ---
 static void apply_operation(NetMessage *msg) {
     pthread_mutex_lock(&doc_mutex);
 
@@ -578,14 +557,12 @@ static void apply_operation(NetMessage *msg) {
             break;
 
         case C2S_RECONNECT_SYNC:
-            // Handled separately
             break;
     }
 
     pthread_mutex_unlock(&doc_mutex);
 }
 
-// --- Run code blocks ---
 static void run_code_block(NetMessage *msg) {
     char filename[] = "/tmp/collab_code_XXXXXX.c";
     char exename[]  = "/tmp/collab_code_XXXXXX";
